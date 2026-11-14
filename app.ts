@@ -1,169 +1,277 @@
-// The HTTP server: one node:http process, stdlib only. Routes:
-//   GET  /healthz                 (no auth)
-//   *    /{owner}/{repo}.git/*    git smart HTTP
-//   *    /api/v3/*                REST v3
-//   POST /api/graphql             GraphQL
-//   POST /mcp                     MCP (JSON-RPC over Streamable HTTP)
-// Every JSON reply carries X-GitHub-Request-Id and application/json.
+// app.ts — the HTTP server.
+// Routes:
+//   GET  /healthz                                  (no auth)
+//   /<owner>/<repo>.git/info/refs                 (git smart HTTP)
+//   /<owner>/<repo>.git/git-upload-pack
+//   /<owner>/<repo>.git/git-receive-pack
+//   /api/v3/...                                    (REST v3)
+//   /api/graphql                                   (GraphQL)
+//   /mcp                                           (MCP)
+// Every response is JSON except git responses, and every response carries
+// a non-empty X-GitHub-Request-Id. Missing/wrong Bearer token is 401 on
+// every authenticated route; unknown routes are JSON 404.
 
-import http from 'node:http';
-import { Store } from './store.ts';
-import { handleInfoRefs, handleUploadPack, handleReceivePack } from './git.ts';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { Forge } from './store.ts';
+import {
+  handleFetchV0,
+  handleFetchV2,
+  handleLsRefs,
+  handleReceivePack,
+  parseV0Request,
+  parseV2Request,
+  v0Advertisement,
+  v2Advertisement,
+} from './git.ts';
 import { handleRest } from './rest.ts';
-import { GraphQLContext, handleGraphQL } from './graphql.ts';
-import { handleMcp } from './mcp.ts';
+import { executeGraphQL } from './graphql.ts';
+import { handleMcpBody } from './mcp.ts';
 
-export function createServer(store = new Store()) {
-  const gql = new GraphQLContext(store);
-  let requestCounter = 0;
-  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+export const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? 'local-dev-token';
 
-  function sendJson(res, status, body, extraHeaders = {}) {
-    const payload = JSON.stringify(body);
-    res.writeHead(status, {
-      'content-type': 'application/json',
-      'x-github-request-id': String(++requestCounter),
-      'content-length': Buffer.byteLength(payload),
-      ...extraHeaders,
+let requestCounter = 0;
+
+function nextRequestId(): string {
+  requestCounter += 1;
+  return `req-${process.pid}-${Date.now()}-${requestCounter}`;
+}
+
+function readBody(request: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    request.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > 64 * 1024 * 1024) {
+        reject(new Error('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
     });
-    res.end(payload);
+    request.on('end', () => resolve(Buffer.concat(chunks)));
+    request.on('error', reject);
+  });
+}
+
+function jsonResponse(
+  response: ServerResponse,
+  status: number,
+  body: unknown,
+  requestId: string,
+  extraHeaders: Record<string, string> = {},
+): void {
+  const payload = JSON.stringify(body);
+  response.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+    'X-GitHub-Request-Id': requestId,
+    ...extraHeaders,
+  });
+  response.end(payload);
+}
+
+function isAuthorized(request: IncomingMessage): boolean {
+  const header = request.headers.authorization;
+  if (typeof header !== 'string') return false;
+  const match = /^Bearer (.+)$/.exec(header);
+  if (!match) return false;
+  return match[1] === SHOP_TOKEN;
+}
+
+function decodePathSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
+}
 
-  function sendBuffer(res, status, contentType, body, extraHeaders = {}) {
-    res.writeHead(status, {
-      'content-type': contentType,
-      'x-github-request-id': String(++requestCounter),
-      'content-length': body.length,
-      ...extraHeaders,
-    });
-    res.end(body);
-  }
+function wantsV2(request: IncomingMessage): boolean {
+  const header = request.headers['git-protocol'];
+  return typeof header === 'string' && header.includes('version=2');
+}
 
-  function readBody(req) {
-    return new Promise((resolve, reject) => {
-      const chunks = [];
-      req.on('data', (chunk) => chunks.push(chunk));
-      req.on('end', () => resolve(Buffer.concat(chunks)));
-      req.on('error', reject);
-    });
-  }
+export function createApp(): { server: ReturnType<typeof createServer>; forge: Forge } {
+  const forge = new Forge();
 
-  async function handle(req, res) {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const method = req.method ?? 'GET';
-    const path = decodeURIComponent(url.pathname);
+  const server = createServer(async (request, response) => {
+    const requestId = nextRequestId();
+    const url = new URL(request.url ?? '/', 'http://localhost');
+    const path = url.pathname;
+    const method = request.method ?? 'GET';
 
-    // Unauthenticated health check.
-    if (path === '/healthz') {
-      if (method !== 'GET') return sendJson(res, 404, { message: 'Not Found' });
-      return sendJson(res, 200, { status: 'ok' });
-    }
-
-    const body = await readBody(req);
-
-    // Auth: when MAKEFUN_SHOP_TOKEN is set, every protected route requires an
-    // exact Bearer match; in local dev (unset) any non-empty Bearer is fine.
-    const isGit = path.endsWith('.git/info/refs') || path.endsWith('.git/git-upload-pack') || path.endsWith('.git/git-receive-pack');
-    const isProtected = path.startsWith('/api/v3') || path.startsWith('/api/graphql') || path === '/mcp' || isGit;
-    if (isProtected) {
-      const auth = req.headers.authorization ?? '';
-      const presented = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
-      if (presented === '' || (token !== '' && presented !== token)) {
-        return sendJson(res, 401, { message: 'Bad credentials' });
+    try {
+      if (path === '/healthz') {
+        jsonResponse(response, 200, { status: 'ok' }, requestId);
+        return;
       }
-    }
 
-    // Git smart HTTP: /{owner}/{repo}.git/{service}
-    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-    if (gitMatch) {
-      const owner = gitMatch[1];
-      const repoName = gitMatch[2];
-      const service = gitMatch[3];
-      const repo = store.getRepo(owner, repoName);
-      if (!repo) return sendJson(res, 404, { message: 'Not Found' });
-      const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-      if (service === 'info/refs') {
-        const queryService = url.searchParams.get('service') ?? '';
-        const which = queryService === 'git-receive-pack' ? 'git-receive-pack' : 'git-upload-pack';
-        const out = handleInfoRefs(repo, which, isV2 && which === 'git-upload-pack');
-        return sendBuffer(res, out.status, out.contentType, out.body);
-      }
-      if (service === 'git-upload-pack') {
-        if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
-        const out = handleUploadPack(repo, body, isV2);
-        if (out.json) return sendJson(res, out.status, out.json);
-        return sendBuffer(res, out.status, out.contentType, out.body);
-      }
-      if (service === 'git-receive-pack') {
-        if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
-        const out = handleReceivePack(repo, body);
-        if (out.json) return sendJson(res, out.status, out.json);
-        return sendBuffer(res, out.status, out.contentType, out.body);
-      }
-    }
-
-    // GraphQL.
-    if (path === '/api/graphql') {
-      if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
-      let parsed;
-      try {
-        parsed = JSON.parse(body.toString('utf8'));
-      } catch {
-        return sendJson(res, 400, { message: 'Bad Request: invalid JSON' });
-      }
-      const result = handleGraphQL(gql, parsed);
-      return sendJson(res, 200, result);
-    }
-
-    // MCP.
-    if (path === '/mcp') {
-      if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
-      let parsed;
-      try {
-        parsed = JSON.parse(body.toString('utf8'));
-      } catch {
-        // Non-JSON body: JSON-RPC parse error -32700.
-        return sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
-      }
-      const out = handleMcp({ store }, parsed);
-      if (out.json === null) {
-        res.writeHead(202, { 'x-github-request-id': String(++requestCounter), 'content-length': 0 });
-        return res.end();
-      }
-      return sendJson(res, out.status, out.json);
-    }
-
-    // REST v3.
-    if (path.startsWith('/api/v3')) {
-      const segments = path.slice('/api/v3'.length).split('/').filter((s) => s !== '');
-      let parsed;
-      if (body.length > 0) {
-        try {
-          parsed = JSON.parse(body.toString('utf8'));
-        } catch {
-          return sendJson(res, 400, { message: 'Bad Request: invalid JSON' });
+      // Git smart HTTP: /<owner>/<repo>.git/info/refs, /git-upload-pack, /git-receive-pack
+      const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+      if (gitMatch !== null) {
+        const owner = decodePathSegment(gitMatch[1] as string);
+        const repoName = decodePathSegment(gitMatch[2] as string);
+        const action = gitMatch[3] as string;
+        const repo = forge.getRepo(owner, repoName);
+        if (repo === undefined) {
+          jsonResponse(response, 404, { message: 'Not Found' }, requestId);
+          return;
         }
+        if (!isAuthorized(request)) {
+          jsonResponse(response, 401, { message: 'Requires authentication' }, requestId);
+          return;
+        }
+        const service = url.searchParams.get('service');
+        const body = method === 'POST' ? await readBody(request) : Buffer.alloc(0);
+        if (action === 'info/refs' && method === 'GET') {
+          if (service === 'git-upload-pack') {
+            const payload = wantsV2(request) ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
+            response.writeHead(200, {
+              'Content-Type': 'application/x-git-upload-pack-advertisement',
+              'Content-Length': payload.length,
+              'X-GitHub-Request-Id': requestId,
+            });
+            response.end(payload);
+            return;
+          }
+          if (service === 'git-receive-pack') {
+            const payload = v0Advertisement(repo, 'git-receive-pack');
+            response.writeHead(200, {
+              'Content-Type': 'application/x-git-receive-pack-advertisement',
+              'Content-Length': payload.length,
+              'X-GitHub-Request-Id': requestId,
+            });
+            response.end(payload);
+            return;
+          }
+          jsonResponse(response, 400, { message: 'Missing service parameter' }, requestId);
+          return;
+        }
+        if (action === 'git-upload-pack' && method === 'POST') {
+          const parsed = parseV2Request(body);
+          let payload: Buffer;
+          if (parsed.command === 'ls-refs') {
+            payload = handleLsRefs(repo, parsed.args);
+          } else if (parsed.command === 'fetch') {
+            payload = handleFetchV2(repo, parsed.args);
+          } else {
+            payload = handleFetchV0(repo, parseV0Request(body));
+          }
+          response.writeHead(200, {
+            'Content-Type': 'application/x-git-upload-pack-result',
+            'Content-Length': payload.length,
+            'X-GitHub-Request-Id': requestId,
+          });
+          response.end(payload);
+          return;
+        }
+        if (action === 'git-receive-pack' && method === 'POST') {
+          const payload = handleReceivePack(repo, body);
+          response.writeHead(200, {
+            'Content-Type': 'application/x-git-receive-pack-result',
+            'Content-Length': payload.length,
+            'X-GitHub-Request-Id': requestId,
+          });
+          response.end(payload);
+          return;
+        }
+        jsonResponse(response, 405, { message: 'Method Not Allowed' }, requestId);
+        return;
       }
-      const out = handleRest({ store, method, segments, query: url.searchParams, body: parsed, host: req.headers.host ?? 'localhost' });
-      if (out.status === 204) {
-        res.writeHead(204, { 'x-github-request-id': String(++requestCounter), ...out.headers });
-        return res.end();
+
+      // REST v3
+      if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+        if (!isAuthorized(request)) {
+          jsonResponse(response, 401, { message: 'Requires authentication' }, requestId);
+          return;
+        }
+        const rawBody = method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE' ? await readBody(request) : Buffer.alloc(0);
+        let parsed: unknown = null;
+        if (rawBody.length > 0) {
+          try {
+            parsed = JSON.parse(rawBody.toString('utf8'));
+          } catch {
+            jsonResponse(response, 400, { message: 'Problems parsing JSON' }, requestId);
+            return;
+          }
+        }
+        const bodyObject = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : null;
+        const baseUrl = `http://${request.headers.host ?? '127.0.0.1'}`;
+        const restResult = handleRest(method, path, url.searchParams, bodyObject, { forge, baseUrl });
+        if (restResult === null) {
+          jsonResponse(response, 404, { message: 'Not Found' }, requestId);
+          return;
+        }
+        jsonResponse(response, restResult.status, restResult.body, requestId, restResult.headers ?? {});
+        return;
       }
-      return sendJson(res, out.status, out.json, out.headers ?? {});
+
+      // GraphQL
+      if (path === '/api/graphql') {
+        if (method !== 'POST') {
+          jsonResponse(response, 405, { message: 'Method Not Allowed' }, requestId);
+          return;
+        }
+        if (!isAuthorized(request)) {
+          jsonResponse(response, 401, { message: 'Requires authentication' }, requestId);
+          return;
+        }
+        const rawBody = await readBody(request);
+        let payload: unknown;
+        try {
+          payload = JSON.parse(rawBody.toString('utf8'));
+        } catch {
+          jsonResponse(response, 400, { errors: [{ message: 'Problems parsing JSON' }] }, requestId);
+          return;
+        }
+        // Batched operations: a JSON array is answered in order.
+        if (Array.isArray(payload)) {
+          const results = payload.map((entry) => {
+            const item = entry as { query?: string; variables?: Record<string, unknown>; operationName?: string };
+            if (typeof item?.query !== 'string') return { data: null, errors: [{ message: 'A GraphQL operation must provide a query string' }] };
+            return executeGraphQL(forge, item.query, item.variables ?? {}, item.operationName);
+          });
+          jsonResponse(response, 200, results, requestId);
+          return;
+        }
+        const item = payload as { query?: string; variables?: Record<string, unknown>; operationName?: string };
+        if (typeof item?.query !== 'string') {
+          jsonResponse(response, 400, { errors: [{ message: 'A GraphQL operation must provide a query string' }] }, requestId);
+          return;
+        }
+        const result = executeGraphQL(forge, item.query, item.variables ?? {}, item.operationName);
+        jsonResponse(response, 200, result, requestId);
+        return;
+      }
+
+      // MCP
+      if (path === '/mcp') {
+        if (method !== 'POST') {
+          jsonResponse(response, 405, { message: 'Method Not Allowed' }, requestId);
+          return;
+        }
+        if (!isAuthorized(request)) {
+          jsonResponse(response, 401, { message: 'Requires authentication' }, requestId);
+          return;
+        }
+        const rawBody = await readBody(request);
+        const result = handleMcpBody(forge, rawBody.toString('utf8'));
+        // Pre-2026-07-28 clients get a parse error inside HTTP 200.
+        const status = result.status === 400 && request.headers['mcp-protocol-version'] !== '2026-07-28' ? 200 : result.status;
+        jsonResponse(response, status, result.body, requestId);
+        return;
+      }
+
+      // Everything else: a JSON 404, never HTML.
+      jsonResponse(response, 404, { message: 'Not Found' }, requestId);
+    } catch (err) {
+      // A handler failure must never leak a stack trace or an HTML page.
+      const message = err instanceof Error ? err.message : String(err);
+      jsonResponse(response, 500, { message: `Internal Server Error: ${message}` }, requestId);
     }
-
-    return sendJson(res, 404, { message: 'Not Found' });
-  }
-
-  const server = http.createServer((req, res) => {
-    handle(req, res).catch((err) => {
-      try {
-        sendJson(res, 500, { message: `Internal Server Error: ${err.message}` });
-      } catch {
-        res.destroy();
-      }
-    });
   });
 
-  return { server, store };
+  return { server, forge };
 }

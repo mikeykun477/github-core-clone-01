@@ -1,39 +1,56 @@
 # github-core-clone-01
 
-A standalone GitHub-compatible git forge: one process, no UI, serving from its
-own in-memory store:
+A GitHub-compatible git forge in a single Node process, standard library only.
 
-- git smart HTTP (`/{owner}/{repo}.git`): upload-pack protocol v2 (ls-refs,
-  fetch, shallow/deepen) and v0, receive-pack v0 with report-status and
-  side-band-64k; packfiles built and read with `node:zlib`/`node:crypto` only,
-  no git binary.
-- REST v3 under `/api/v3`: repositories, branches, commits, contents, labels,
-  issues, comments, pull requests, files and squash merges.
-- GraphQL v4 at `/api/graphql`: the documents `gh` and `github-mcp-server`
-  send (viewer, repository, issues, pull requests, mutations, `__type`
-  introspection, `node(id:)`, cursor pagination, batched operations).
-- MCP at `/mcp`: JSON-RPC 2.0 over Streamable HTTP, revision 2026-07-28
-  (`server/discover`, `tools/list`, `tools/call`).
+## What it is
 
-## Run it
+One process, one in-memory store, four interfaces over the same data:
+
+- **Git smart HTTP** — `git clone` / `fetch` / `push` over HTTP, protocol v2
+  and v0, `upload-pack` and `receive-pack`, plain v2 packs.
+- **REST v3** — repositories, branches, commits, refs, contents, labels,
+  issues, comments and pull requests under `/api/v3`.
+- **GraphQL** — the queries and mutations `gh` and `github-mcp-server`
+  send, under `/api/graphql`, with opaque global ids.
+- **MCP** — `server/discover` (2026-07-28) and the legacy `initialize`
+  handshake, `tools/list` and `tools/call`, under `/mcp`.
+
+## Run
 
 ```sh
-node main.ts
+node --experimental-strip-types main.ts
 ```
 
-The platform runs `node /bot/main.ts` (Node 22). The program binds an
-ephemeral port, POSTs it to `$MAKEFUN_ENV_URL/register`, then polls
-`$MAKEFUN_ENV_URL/done` until the suite is over and exits 0. `MAKEFUN_SHOP_TOKEN`
-is the bearer token every API call must carry. Only the standard library is
-used; there is nothing to install.
+Node 22 or newer. No dependencies. The server listens on an ephemeral
+port (or `$PORT`) and prints it. Auth is a Bearer token:
+`$MAKEFUN_SHOP_TOKEN`, defaulting to `local-dev-token` for local runs.
+
+With `$MAKEFUN_ENV_URL` set, the server registers its port with the env
+service and exits when the run reports done.
 
 ## Layout
 
-- `main.ts` — the entry <-> env lifecycle (bind, register, wait for done).
-- `app.ts` — the HTTP server: routing, auth, JSON discipline.
-- `store.ts` — the in-memory store and the git object model (hashing, trees,
-  commits, tags, packfiles, reachability, diffs, merges).
-- `git.ts` — git smart HTTP (advertisements, upload-pack v2/v0, receive-pack).
-- `rest.ts` — the REST v3 surface.
-- `graphql.ts` — a small GraphQL parser and executor for the v4 surface.
-- `mcp.ts` — the MCP endpoint (discover, tools/list, tools/call).
+| File | Contents |
+| --- | --- |
+| `main.ts` | Entry point and env lifecycle. |
+| `app.ts` | HTTP server, auth, routing. |
+| `store.ts` | In-memory store, git object model, packs, deterministic viewer. |
+| `git.ts` | Smart HTTP: pkt-lines, fetch v2/v0, receive-pack. |
+| `rest.ts` | REST v3 handlers. |
+| `graphql.ts` | GraphQL parser and executor. |
+| `mcp.ts` | MCP JSON-RPC handlers and tools. |
+
+Timestamps in the store use a deterministic logical clock so a live run
+and a replay produce the same bytes. Packs sent to clients are plain
+(no deltas); packs received are fully parsed, including OFS and REF deltas.
+
+## Verify
+
+Start the server, then run the kit's sealed runner against it from the
+kit directory:
+
+```sh
+node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:<port> --token local-dev-token --perf --json
+```
+
+Start a fresh server for every run; the suite mutates state by design.
